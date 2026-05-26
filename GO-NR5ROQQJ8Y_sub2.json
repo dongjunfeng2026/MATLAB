@@ -1,0 +1,35 @@
+{
+  "exported_at": "2026-05-26T13:33:16+08:00",
+  "proxies": [],
+  "accounts": [
+    {
+      "name": "Adolfozeltwanger0664+phviif",
+      "platform": "openai",
+      "type": "oauth",
+      "concurrency": 10,
+      "priority": 1,
+      "credentials": {
+        "access_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6IjE5MzQ0ZTY1LWJiYzktNDRkMS1hOWQwLWY5NTdiMDc5YmQwZSIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS92MSJdLCJjbGllbnRfaWQiOiJhcHBfRU1vYW1FRVo3M2YwQ2tYYVhwN2hyYW5uIiwiZXhwIjoxNzgwNjAyNTUzLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiYW1yIjpbInB3ZCJdLCJjaGF0Z3B0X2NvbXB1dGVfcmVzaWRlbmN5Ijoibm9fY29uc3RyYWludCIsImNoYXRncHRfZGF0YV9yZXNpZGVuY3kiOiJub19jb25zdHJhaW50IiwibG9jYWxob3N0Ijp0cnVlLCJ1c2VyX2lkIjoidXNlci1rOGNJUThBbjZROEdRT3ljWnRRTXYwMmsifSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9wcm9maWxlIjp7ImVtYWlsIjoiQWRvbGZvWmVsdHdhbmdlcjA2NjQrcGhWaWlGQG91dGxvb2suY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWV9LCJpYXQiOjE3Nzk3Mzg1NTMsImlzcyI6Imh0dHBzOi8vYXV0aC5vcGVuYWkuY29tIiwianRpIjoiNjhiYmE4OTItY2FlMi00MGNhLTk4ZjUtNDg0MDMyMTY2M2JhIiwibmJmIjoxNzc5NzM4NTUzLCJwd2RfYXV0aF90aW1lIjoxNzc5NzM4NTQ3MTA2LCJzY3AiOlsib3BlbmlkIiwicHJvZmlsZSIsImVtYWlsIiwib2ZmbGluZV9hY2Nlc3MiLCJhcGkuY29ubmVjdG9ycy5yZWFkIiwiYXBpLmNvbm5lY3RvcnMuaW52b2tlIl0sInNlc3Npb25faWQiOiJhdXRoc2Vzc18xQVJrZVA5YzZJSk5IMnFCVnhLbTlONVUiLCJzbCI6dHJ1ZSwic3ViIjoiYXV0aDB8S0xBZDA1VUxhcjhYN0Y5alhwVVFXOGV1In0.Rf_fUNQdx9X_ao-s3Y_PQgM5jfKkupiKN6CSJw3zB1iTcClqmEZwgjLlb1hkn6kxsjw6jpXq3L545qQJQcPzhgnwY4IMHF809N3o10-BPRI9_Kk-tgETxuKUenrQMmdFMKhrMGEZ_2yfrxJfyV-1EplRT9X5uxS1BQfHFCN_FB-OXmDe2VqEvMRKOJAoykSO-NWD08qFesm8Xtz6kDKwTDSdsU18Wc1Taf1k3q2HtX31LMG1PB6pZCiDhMKVSeSKg3rVrudjLw_NogyJsxkzo4qA3QVQm_i72yAtnWooEdH8elJQl31fF7LlEPq484upcaeY3kPXlml8dArGeyuLA79EPhXa_UIp9mFfZdRpl7FcEoejLTD1a1nABlHTVMfN7mAYODDZnD88c2aqT3d-xOOjPNk59gigMIbCiocLKzrtbp2-xSrXTwlSjyRfCHCKZ-8TRoVZCLOj7W8NatbCkiLbZv6zrKOg-jSkYtSbMb4cU-sXoqWLUmCJeynK2JfZt_wW_TczJy3CAFslXr7gS9WOH-pfgdBIo8hAJOFEMXxrdS2kamr9Z6sY5EZxD95lpZrt0LoGoiBwh1Wgmzg3BxfC8ImtKmwdsAtpxfqzNt8ikMg2eo7a5tzYDrtcH_d4IyaJRcp35167fw3tRcV0Ktlt73_QfNE8q8Uq_-1XphI",
+        "refresh_token": "rt_lsmIPBfauwsBCMKCnhmr9kgTVJIXgwhzh1OxP-_A-XA.yLCYsBZ4SSbZDi4Sr5DjsjIKQLNdg-cEqOQkxpG4xkk",
+        "id_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImIxZGQzZjhmLTlhYWQtNDdmZS1iMGU3LWVkYjAwOTc3N2Q2YiIsInR5cCI6IkpXVCJ9.eyJhbXIiOlsicHdkIl0sImF0X2hhc2giOiJYcUxiYnJVLTBpTHJlT3l4WWpZTnRBIiwiYXVkIjpbImFwcF9FTW9hbUVFWjczZjBDa1hhWHA3aHJhbm4iXSwiYXV0aF9wcm92aWRlciI6InBhc3N3b3JkIiwiYXV0aF90aW1lIjoxNzc5NzM4NTQ3LCJlbWFpbCI6IkFkb2xmb1plbHR3YW5nZXIwNjY0K3BoVmlpRkBvdXRsb29rLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjE3Nzk3NDIxNTMsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJncm91cHMiOltdLCJsb2NhbGhvc3QiOnRydWUsIm9yZ2FuaXphdGlvbnMiOlt7ImlkIjoib3JnLWZqRUpCWEFvdkZET0RtVDFuc1YyTG5HWSIsImlzX2RlZmF1bHQiOnRydWUsInJvbGUiOiJvd25lciIsInRpdGxlIjoiUGVyc29uYWwifV0sInVzZXJfaWQiOiJ1c2VyLWs4Y0lROEFuNlE4R1FPeWNadFFNdjAyayJ9LCJpYXQiOjE3Nzk3Mzg1NTMsImlzcyI6Imh0dHBzOi8vYXV0aC5vcGVuYWkuY29tIiwianRpIjoiNzgxZWRhZWYtOTgxYi00M2M5LTkyZjktMDNhZDQ0ZTczYWRiIiwibmFtZSI6Ikx5ZGlhIERhd3NvbiIsInJhdCI6MTc3OTczODQ5Miwic2lkIjoiM2FkZmM0MjUtNzNhMS00MDYzLTkwZTktYmU2MzhjMWU2YjE1Iiwic3ViIjoiYXV0aDB8S0xBZDA1VUxhcjhYN0Y5alhwVVFXOGV1In0.JvkYpLW4LUDuX5X9HMrCjdchJP32CvbkUXdRvnQOuPkKBcPqLhzwjZXQtSMBLukgUo8BCVqBrIOasrxt-zD0Qou-kKXz74ydFq6MuEYqq4Byi6SI16_ov1lPtqibVBOhYqvqnAgT04SCb4KfJgq8rtk-SH_brtWKmi7xKNPiIA1OaHTmy-BYtGiZXZ5TPlyMQrVeL2vlVrkVkId-IcZykXsMSkCfa9Ckensoyih-QTp5BeUEHBPSO6uiRaz0j2cjWjGrCHbUB3OwPGlmAuTwdkNyENboo1LQIhiTqOQUsjeWg5emI-Bsq8JRK8KWM1k5mPZhz4U7SgTaF3F0yJ27S9tzVOALq0rnS3k4eDixVZGFC8-RrmhyvJadaS09a81jbXQeZ3XULm6iibCWW8F09z-Dk3jP4kjUmsHZAo3vUC2o9kpei69gOeDV1xJC00XL_z3kMZS3Uc7bRo40RY4REscKohyxFYqJNXLY3SQxJ17zSBtIqZJ-RecWDBhyNkz3UmtgP7Pi1Uiu-vBZaP7OIe46qqZ04iIrV_NXDZ4R70_BpmTCnY_FoHkHmwypYeao6sQR77i30-vGgWBmOd2Ad_tmFtBYf8D8fu_-3mTq3IC19NE7lrPxtC0kmJChZkPLTLismjNF2AklyfCqzzwvt-gUEHAspfWxczvC_9umTcI",
+        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+        "account_id": "43e74ba7-ddcd-4db7-8887-e75d00a4052c",
+        "chatgpt_account_id": "43e74ba7-ddcd-4db7-8887-e75d00a4052c",
+        "chatgpt_user_id": "user-k8cIQ8An6Q8GQOycZtQMv02k",
+        "workspace_id": "43e74ba7-ddcd-4db7-8887-e75d00a4052c",
+        "organization_id": "org-fjEJBXAovFDODmT1nsV2LnGY",
+        "email": "adolfozeltwanger0664+phviif@outlook.com",
+        "expires_at": 1780602553,
+        "expires_in": 864000,
+        "plan_type": "plus"
+      },
+      "extra": {
+        "email": "adolfozeltwanger0664+phviif@outlook.com",
+        "email_key": "adolfozeltwanger0664+phviif@outlook.com",
+        "name": "Adolfozeltwanger0664+phviif",
+        "source": "go-pool",
+        "last_refresh": "2026-05-26T13:33:16+08:00"
+      }
+    }
+  ]
+}
