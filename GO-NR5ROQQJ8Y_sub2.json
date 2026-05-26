@@ -27,19 +27,44 @@
 #define V_BUS_MIN_MV          (300U * 1000U)   /* 母线电压下限 300V */
 #define V_BUS_MAX_MV          (400U * 1000U)   /* 母线电压上限 400V */
 #define I_PRI_MAX_MA          (15U * 1000U)    /* 原边电流上限 15A  */
-#define TEMP_MAX_C            (85)             /* 关键器件温度上限  */
-#define TEMP_WARN_C           (70)             /* 降功率温度阈值    */
 #define COMM_TIMEOUT_MS       (1500U)          /* 与机器人通信超时  */
 #define CHARGE_TIMEOUT_MS     (3UL * 3600UL * 1000UL) /* 单次充电最长 3h */
 
-/* ----- 充电完成判据 ----- */
-#define I_CUTOFF_MA           (500U)           /* 充电截止电流 0.5A  */
-#define V_FULL_MV             (54U * 1000U)    /* 满电电压 54V (示例) */
+/* ----- CC-CV 充电参数（对应左图流程） ----- */
+#define U_CV_MV               (24000U)         /* CV 切换电压 Ucv = 24V */
+#define I_CC_MA               (10000U)         /* CC 阶段恒定电流 Iout = 10A */
+#define I_CUT_MA              (500U)           /* 充电截止电流 Icut = 0.5A */
+#define I_CUTOFF_MA           I_CUT_MA         /* 兼容旧名 */
+#define V_FULL_MV             U_CV_MV          /* 满电电压等同 Ucv */
+
+/* ----- 二级温度保护（对应右图流程） ----- */
+#define TEMP_T1_C             (70)             /* 一级阈值 T1：触发功率降额 */
+#define TEMP_T2_C             (85)             /* 二级阈值 T2：停机保护 */
+#define TEMP_WARN_C           TEMP_T1_C        /* 兼容旧名 */
+#define TEMP_MAX_C            TEMP_T2_C        /* 兼容旧名 */
+#define DERATE_DUTY_FACTOR    (0.70f)          /* 降额时占空比折算系数 */
+
+/* ----- 输入过流锁定+延时复检（对应右图流程） ----- */
+#define I_IN_MAX_MA           (15U * 1000U)    /* 输入电流过流阈值 Imax */
+#define OC_LOCK_DELAY_MS      (2000U)          /* 锁定后延时检测时间 2s */
+#define OC_RETRY_LIMIT        (3U)             /* 最多自恢复尝试次数   */
 
 /* ----- PWM / 逆变 ----- */
 #define PWM_FREQ_HZ           (85000U)         /* WPT 谐振频率 85kHz */
 #define PWM_DEAD_TIME_NS      (300U)           /* MOSFET 死区 300ns */
 #define PWM_DUTY_DEFAULT      (0.45f)          /* 默认占空比         */
+#define PWM_DUTY_MIN          (0.05f)          /* 占空比下限         */
+#define PWM_DUTY_MAX          (0.48f)          /* 占空比上限         */
+#define PWM_DUTY_SOFTSTART    (0.10f)          /* 软启动起始占空比   */
+#define SOFT_START_STEP       (0.02f)          /* 软启动每步增量     */
+#define SOFT_START_INTERVAL   (50U)            /* 软启动每步间隔 ms  */
+
+/* ----- CC-CV PI 闭环参数（按实际系统整定） ----- */
+#define KP_CC                 (0.00002f)       /* CC 环比例 */
+#define KI_CC                 (0.000002f)      /* CC 环积分 */
+#define KP_CV                 (0.00003f)       /* CV 环比例 */
+#define KI_CV                 (0.000003f)      /* CV 环积分 */
+#define CTRL_PERIOD_MS        (10U)            /* 控制环周期 */
 
 /* ----- 故障码 ----- */
 #define ERR_NONE              0x0000
@@ -53,6 +78,7 @@
 #define ERR_COMM_LOST         0x0080
 #define ERR_FOREIGN_OBJECT    0x0100   /* FOD: 异物检测 */
 #define ERR_TIMEOUT           0x0200
+#define ERR_OC_LOCKED         0x0400   /* 过流锁定后多次重试仍异常 */
 
 /* ============================== 类型定义 =================================== */
 typedef enum {
@@ -60,12 +86,20 @@ typedef enum {
     STATE_STANDBY,         /* 待机检测            */
     STATE_REQ_RECEIVED,    /* 接收到充电请求      */
     STATE_SELF_TEST,       /* 安全自检            */
-    STATE_INVERTER_ON,     /* 启动逆变输出        */
-    STATE_CHARGING,        /* 充电过程监测        */
+    STATE_INVERTER_ON,     /* 启动逆变输出(软启动)*/
+    STATE_CHARGING,        /* 充电过程监测+CC/CV  */
+    STATE_OC_LOCKOUT,      /* 过流锁定+延时检测   */
+    STATE_SOFT_RESTART,    /* 异常消除后软启动恢复 */
     STATE_OUTPUT_OFF,      /* 关闭输出            */
     STATE_FAULT,           /* 故障保护(停机/报警) */
     STATE_WAIT_RECOVER     /* 等待恢复            */
 } sys_state_t;
+
+typedef enum {
+    CHG_PHASE_CC = 0,      /* 恒流阶段 (Iout = I_CC_MA) */
+    CHG_PHASE_CV,          /* 恒压阶段 (Vout = U_CV_MV) */
+    CHG_PHASE_DONE         /* Iout < Icut, 充电完成     */
+} chg_phase_t;
 
 typedef struct {
     uint32_t v_bus_mv;       /* 直流母线电压 mV   */
@@ -88,6 +122,20 @@ typedef struct {
     uint32_t     charge_start_tick;
     bool         charge_request;
     bool         stop_request;
+
+    /* CC-CV 控制 */
+    chg_phase_t  phase;
+    float        pwm_duty;          /* 当前占空比，闭环维护 */
+    float        integ_cc;          /* CC 环积分项 */
+    float        integ_cv;          /* CV 环积分项 */
+    uint32_t     last_ctrl_tick;
+
+    /* 二级温度保护 */
+    bool         derate_active;     /* T1 < T < T2: 已降额 */
+
+    /* 过流锁定+延时复检 */
+    uint32_t     oc_lock_tick;      /* 进入锁定的时刻 */
+    uint8_t      oc_retry_cnt;      /* 累计重试次数   */
 } fsm_ctx_t;
 
 /* ============================== 全局对象 =================================== */
@@ -109,9 +157,13 @@ static void   Sensor_Sample(void);
 static bool   Comm_CheckRequest(void);
 static bool   SelfTest_Run(uint16_t *err);
 static void   Inverter_Start(void);
+static void   Inverter_SoftStart_Step(void);     /* 软启动步进，斜坡升占空比 */
 static void   Inverter_Stop(void);
+static void   Inverter_SetDuty(float duty);
 static bool   Charge_IsComplete(void);
+static void   Charge_CCCV_Control(void);          /* CC-CV 闭环控制 */
 static bool   Charge_DetectAbnormal(uint16_t *err);
+static void   Power_Derate(bool on);              /* T>T1 降额；T<T1 恢复 */
 static void   Fault_Trigger(uint16_t err);
 static bool   Fault_TryRecover(void);
 
@@ -207,23 +259,87 @@ static void FSM_Run(void)
         }
         break;
 
-    /* -------- 启动逆变输出（输出使能） -------- */
+    /* -------- 启动逆变输出（输出使能 + 软启动）-------- */
     case STATE_INVERTER_ON:
-        Inverter_Start();
+        Inverter_Start();                        /* 起始小占空比 */
         g_fsm.charge_start_tick = HAL_GetTick();
+        g_fsm.phase             = CHG_PHASE_CC;
+        g_fsm.integ_cc          = 0.0f;
+        g_fsm.integ_cv          = 0.0f;
+        g_fsm.derate_active     = false;
+        g_fsm.last_ctrl_tick    = HAL_GetTick();
         FSM_Goto(STATE_CHARGING);
         break;
 
-    /* -------- 充电过程监测（电压/电流/温度/通信） -------- */
+    /* -------- 充电过程监测 + CC-CV 控制（左图核心流程）-------- */
     case STATE_CHARGING:
-        if (Charge_DetectAbnormal(&err)) {       /* 监测异常 -> 故障保护 */
+        /* 1) 软启动期间斜坡升占空比 */
+        Inverter_SoftStart_Step();
+
+        /* 2) 异常分级处理（右图：过流/二级温度）*/
+        if (Charge_DetectAbnormal(&err)) {
+            if (err & ERR_OV_CURRENT) {          /* Iin > Imax: 锁定+延时复检 */
+                Inverter_Stop();
+                g_fsm.err_flags  = err;
+                g_fsm.oc_lock_tick = HAL_GetTick();
+                Log_Printf("[OC] lockout, retry=%u/%u\r\n",
+                           g_fsm.oc_retry_cnt, OC_RETRY_LIMIT);
+                FSM_Goto(STATE_OC_LOCKOUT);
+                break;
+            }
+            /* 其它硬故障(T>T2、通信丢失、FOD、超时) -> 直接故障保护 */
             Fault_Trigger(err);
             break;
         }
-        if (Charge_IsComplete() || g_fsm.stop_request) { /* 充满或停充? */
+
+        /* 3) CC-CV 闭环控制（按相位调整占空比）*/
+        if ((HAL_GetTick() - g_fsm.last_ctrl_tick) >= CTRL_PERIOD_MS) {
+            g_fsm.last_ctrl_tick = HAL_GetTick();
+            Charge_CCCV_Control();
+        }
+
+        /* 4) 充满或停充判定 */
+        if (Charge_IsComplete() || g_fsm.stop_request) {
             FSM_Goto(STATE_OUTPUT_OFF);
         }
-        /* 否则继续在该状态循环监测 */
+        break;
+
+    /* -------- 过流锁定 + 延时检测阶段（右图分支）-------- */
+    case STATE_OC_LOCKOUT:
+        /* 全桥逆变已闭锁，等延时窗口结束后重新检测 */
+        if ((HAL_GetTick() - g_fsm.oc_lock_tick) >= OC_LOCK_DELAY_MS) {
+            /* 重新采样后判断异常是否消除 */
+            uint16_t e2 = ERR_NONE;
+            bool still_abnormal =
+                (g_sensor.i_pri_ma > I_IN_MAX_MA) ||
+                (g_sensor.t_mosfet_c > TEMP_T2_C) ||
+                (g_sensor.t_coil_c   > TEMP_T2_C);
+
+            if (!still_abnormal) {
+                g_fsm.oc_retry_cnt++;
+                if (g_fsm.oc_retry_cnt > OC_RETRY_LIMIT) {
+                    /* 超过重试上限 -> 保持闭锁，禁止启动，报警上报 */
+                    Fault_Trigger(ERR_OC_LOCKED);
+                } else {
+                    Log_Printf("[OC] cleared, soft restart\r\n");
+                    FSM_Goto(STATE_SOFT_RESTART);   /* 系统软启动恢复 */
+                }
+            } else {
+                /* 异常未消除 -> 闭锁报警 */
+                e2 = g_fsm.err_flags | ERR_OC_LOCKED;
+                Fault_Trigger(e2);
+            }
+        }
+        break;
+
+    /* -------- 软启动恢复（异常已消除分支）-------- */
+    case STATE_SOFT_RESTART:
+        Inverter_Start();                        /* 重新使能并从低占空比起步 */
+        g_fsm.phase          = CHG_PHASE_CC;
+        g_fsm.integ_cc       = 0.0f;
+        g_fsm.integ_cv       = 0.0f;
+        g_fsm.last_ctrl_tick = HAL_GetTick();
+        FSM_Goto(STATE_CHARGING);
         break;
 
     /* -------- 关闭输出 -------- */
@@ -354,14 +470,31 @@ static bool SelfTest_Run(uint16_t *err)
     return (*err == ERR_NONE);
 }
 
-/* ============================== 逆变启停 =================================== */
+/* ============================== 逆变启停 / 软启动 ========================== */
+static void Inverter_SetDuty(float duty)
+{
+    if (duty < PWM_DUTY_MIN) duty = PWM_DUTY_MIN;
+    if (duty > PWM_DUTY_MAX) duty = PWM_DUTY_MAX;
+    if (g_fsm.derate_active && duty > PWM_DUTY_MAX * DERATE_DUTY_FACTOR) {
+        duty = PWM_DUTY_MAX * DERATE_DUTY_FACTOR;   /* 降额封顶 */
+    }
+    uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim1);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)((arr + 1U) * duty));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)((arr + 1U) * duty));
+    g_fsm.pwm_duty = duty;
+}
+
 static void Inverter_Start(void)
 {
-    /* 高级定时器互补 PWM 输出，先设占空比再使能输出 */
+    /* 高级定时器互补 PWM 输出，先以软启动起始占空比起步 */
     uint32_t arr = (HAL_RCC_GetPCLK2Freq() * 2U) / PWM_FREQ_HZ - 1U;
     __HAL_TIM_SET_AUTORELOAD(&htim1, arr);
+
+    g_fsm.pwm_duty = PWM_DUTY_SOFTSTART;
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1,
-                          (uint32_t)((arr + 1U) * PWM_DUTY_DEFAULT));
+                          (uint32_t)((arr + 1U) * PWM_DUTY_SOFTSTART));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2,
+                          (uint32_t)((arr + 1U) * PWM_DUTY_SOFTSTART));
 
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
     HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
@@ -370,7 +503,21 @@ static void Inverter_Start(void)
 
     /* 输出使能信号 (主继电器/SiC 全桥使能) */
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
-    Log_Printf("[INV] start PWM @ %uHz\r\n", PWM_FREQ_HZ);
+    Log_Printf("[INV] soft start @ %uHz, duty=%d%%\r\n",
+               PWM_FREQ_HZ, (int)(PWM_DUTY_SOFTSTART * 100));
+}
+
+/* 软启动单步：每 SOFT_START_INTERVAL ms 抬升 SOFT_START_STEP，直到达 PWM_DUTY_DEFAULT */
+static void Inverter_SoftStart_Step(void)
+{
+    static uint32_t last_step_tick = 0;
+    if (g_fsm.pwm_duty >= PWM_DUTY_DEFAULT) return;
+    if ((HAL_GetTick() - last_step_tick) < SOFT_START_INTERVAL) return;
+    last_step_tick = HAL_GetTick();
+
+    float d = g_fsm.pwm_duty + SOFT_START_STEP;
+    if (d > PWM_DUTY_DEFAULT) d = PWM_DUTY_DEFAULT;
+    Inverter_SetDuty(d);
 }
 
 static void Inverter_Stop(void)
@@ -382,35 +529,118 @@ static void Inverter_Stop(void)
     HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_2);
 }
 
+/* ============================== CC-CV 闭环控制（左图核心）================== */
+/*  左图流程：
+ *    Ubat < Ucv  --> 恒流(CC)阶段，目标 Iout = I_CC_MA
+ *    Ubat 达 Ucv --> 切恒压(CV)阶段，目标 Vout = U_CV_MV，电流自然下降
+ *    Iout < Icut --> 充电完成，关闭功率输出
+ *  本函数每 CTRL_PERIOD_MS 调用一次，输出闭环占空比
+ */
+static void Charge_CCCV_Control(void)
+{
+    /* 1) 检测电池电压 Ubat (机器人侧通过通信上报到 v_out_mv) */
+    uint32_t ubat = g_sensor.v_out_mv;
+    uint32_t iout = g_sensor.i_out_ma;
+
+    /* 2) 阶段切换判定 */
+    if (g_fsm.phase == CHG_PHASE_CC && ubat >= U_CV_MV) {
+        g_fsm.phase = CHG_PHASE_CV;
+        g_fsm.integ_cv = 0.0f;
+        Log_Printf("[CCCV] Ubat reached Ucv, switch CC->CV\r\n");
+    }
+    if (g_fsm.phase == CHG_PHASE_CV && iout <= I_CUT_MA) {
+        g_fsm.phase = CHG_PHASE_DONE;
+        Log_Printf("[CCCV] Iout < Icut, charge done\r\n");
+        return;
+    }
+
+    /* 3) PI 闭环 */
+    float duty = g_fsm.pwm_duty;
+
+    if (g_fsm.phase == CHG_PHASE_CC) {
+        /* CC: 维持 Iout = I_CC_MA */
+        float err = (float)I_CC_MA - (float)iout;          /* mA */
+        g_fsm.integ_cc += err * (float)CTRL_PERIOD_MS / 1000.0f;
+        /* 抗积分饱和 */
+        if (g_fsm.integ_cc >  10000.0f) g_fsm.integ_cc =  10000.0f;
+        if (g_fsm.integ_cc < -10000.0f) g_fsm.integ_cc = -10000.0f;
+        duty += KP_CC * err + KI_CC * g_fsm.integ_cc;
+    } else if (g_fsm.phase == CHG_PHASE_CV) {
+        /* CV: 维持 Vout = U_CV_MV */
+        float err = (float)U_CV_MV - (float)ubat;          /* mV */
+        g_fsm.integ_cv += err * (float)CTRL_PERIOD_MS / 1000.0f;
+        if (g_fsm.integ_cv >  20000.0f) g_fsm.integ_cv =  20000.0f;
+        if (g_fsm.integ_cv < -20000.0f) g_fsm.integ_cv = -20000.0f;
+        duty += KP_CV * err + KI_CV * g_fsm.integ_cv;
+    }
+
+    Inverter_SetDuty(duty);
+}
+
 /* ============================== 充电完成判定 =============================== */
 static bool Charge_IsComplete(void)
 {
-    /* 恒压尾段电流小于截止值，或 SOC>=99%，或电压达到满电 */
-    if (g_sensor.soc_percent >= 99U) return true;
-    if (g_sensor.v_out_mv >= V_FULL_MV &&
-        g_sensor.i_out_ma <= I_CUTOFF_MA) return true;
+    /* 严格按左图：Iout < Icut 即充电完成；额外保留 SOC 兜底 */
+    if (g_fsm.phase == CHG_PHASE_DONE)            return true;
+    if (g_sensor.i_out_ma < I_CUT_MA &&
+        g_sensor.v_out_mv >= U_CV_MV - 200U)      return true;  /* CV 末端 */
+    if (g_sensor.soc_percent >= 99U)              return true;
     return false;
 }
 
-/* ============================== 充电异常监测 =============================== */
+/* ============================== 功率降额（T1<T<T2）======================== */
+static void Power_Derate(bool on)
+{
+    if (on && !g_fsm.derate_active) {
+        g_fsm.derate_active = true;
+        Log_Printf("[DERATE] T>T1, derate to %d%%\r\n",
+                   (int)(DERATE_DUTY_FACTOR * 100));
+        /* 立即应用一次封顶 */
+        Inverter_SetDuty(g_fsm.pwm_duty);
+    } else if (!on && g_fsm.derate_active) {
+        g_fsm.derate_active = false;
+        Log_Printf("[DERATE] T<T1, restore full power\r\n");
+    }
+}
+
+/* ============================== 异常检测（右图分支判定）==================== */
 static bool Charge_DetectAbnormal(uint16_t *err)
 {
     *err = ERR_NONE;
 
-    if (g_sensor.v_bus_mv > V_BUS_MAX_MV)               *err |= ERR_OV_VOLTAGE;
-    if (g_sensor.i_pri_ma > I_PRI_MAX_MA)               *err |= ERR_OV_CURRENT;
-    if (g_sensor.t_mosfet_c > TEMP_MAX_C ||
-        g_sensor.t_coil_c   > TEMP_MAX_C)               *err |= ERR_OV_TEMP;
-    if (!g_sensor.comm_ok)                              *err |= ERR_COMM_LOST;
+    /* ---- 实时采集 Iin 与线圈温度 T 已在 Sensor_Sample() 完成 ---- */
 
-    /* 异物检测(FOD): 输入功率与输出功率差异异常 -> 简化示例 */
-    uint32_t p_in_w  = (g_sensor.v_bus_mv / 1000U) * (g_sensor.i_pri_ma / 1000U);
-    uint32_t p_out_w = (g_sensor.v_out_mv / 1000U) * (g_sensor.i_out_ma / 1000U);
-    if (p_in_w > 100U && p_out_w + 50U < p_in_w) {       /* 损耗>50W 视为异常 */
-        *err |= ERR_FOREIGN_OBJECT;
+    /* 分支1：Iin 是否超过过流阈值 Imax (右图主分支) */
+    if (g_sensor.i_pri_ma > I_IN_MAX_MA) {
+        *err |= ERR_OV_CURRENT;                  /* 触发异常识别，锁定全桥逆变驱动 */
+        return true;                             /* 立即返回，由上层进入 OC_LOCKOUT */
     }
 
-    /* 充电超时 */
+    /* 分支2：温度二级保护 */
+    int16_t tmax = (g_sensor.t_mosfet_c > g_sensor.t_coil_c)
+                   ? g_sensor.t_mosfet_c : g_sensor.t_coil_c;
+
+    if (tmax > TEMP_T2_C) {
+        /* 超过二级阈值 T2 -> 停机保护并告警 */
+        *err |= ERR_OV_TEMP;
+        return true;
+    } else if (tmax > TEMP_T1_C) {
+        /* 超过一级阈值 T1 -> 执行功率降额，继续运行 */
+        Power_Derate(true);
+    } else {
+        /* 温度恢复 -> 取消降额 */
+        Power_Derate(false);
+    }
+
+    /* 分支3：母线电压、通信、FOD、超时（保留原有保护） */
+    if (g_sensor.v_bus_mv > V_BUS_MAX_MV)         *err |= ERR_OV_VOLTAGE;
+    if (!g_sensor.comm_ok)                        *err |= ERR_COMM_LOST;
+
+    uint32_t p_in_w  = (g_sensor.v_bus_mv / 1000U) * (g_sensor.i_pri_ma / 1000U);
+    uint32_t p_out_w = (g_sensor.v_out_mv / 1000U) * (g_sensor.i_out_ma / 1000U);
+    if (p_in_w > 100U && p_out_w + 50U < p_in_w) {
+        *err |= ERR_FOREIGN_OBJECT;
+    }
     if ((HAL_GetTick() - g_fsm.charge_start_tick) > CHARGE_TIMEOUT_MS) {
         *err |= ERR_TIMEOUT;
     }
@@ -460,9 +690,11 @@ static void LED_SetState(sys_state_t s)
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET); break;
     case STATE_INVERTER_ON:
     case STATE_CHARGING:
+    case STATE_SOFT_RESTART:
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET); break;
     case STATE_FAULT:
     case STATE_WAIT_RECOVER:
+    case STATE_OC_LOCKOUT:
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET); break;
     default: break;
     }
