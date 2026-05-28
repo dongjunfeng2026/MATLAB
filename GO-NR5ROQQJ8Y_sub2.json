@@ -1,35 +1,1106 @@
+/**
+  ******************************************************************************
+  * @file    wireless_charging_station.c
+  * @brief   值守型光伏清洁机器人 —— 自主无线充电系统 / 无线充电基站主控软件
+  * @target  STM32F407 / STM32F103 (HAL 库通用)
+  ******************************************************************************
+  *
+  * ============================================================================
+  *  一、整体架构说明
+  * ============================================================================
+  *  采用「前后台 + 主状态机 (Super-Loop + FSM)」结构：
+  *    - 前台：定时器 / ADC 看门狗 / UART 接收 等中断负责实时性强的任务
+  *            (PWM 输出、过流硬件保护、通信收包)
+  *    - 后台：main() 中的 while(1) 循环负责状态机推进、闭环控制、慢速逻辑
+  *            (CC-CV 闭环、温度判别、状态上报)
+  *  这种结构对功率电子系统是经典做法：硬件级保护放在中断里"瞬时切断"，
+  *  软件级控制放在主循环里"周期决策"，两层互不阻塞。
+  *
+  * ============================================================================
+  *  二、状态机转移图（与你提供的 3 张流程图严格对应）
+  * ============================================================================
+  *
+  *   [INIT] ──► [STANDBY] ◄──────────────────────────────┐
+  *                │ 收到充电请求(robot_in_place + cmd)   │
+  *                ▼                                     │
+  *           [REQ_RECEIVED]                             │
+  *                │                                     │
+  *                ▼                                     │
+  *           [SELF_TEST] ──── 自检失败 ─────────► [FAULT]
+  *                │ 通过                                 │
+  *                ▼                                     │ 故障
+  *           [INVERTER_ON] (软启动起步)                  │ 解除
+  *                │                                     ▼
+  *                ▼                              [WAIT_RECOVER]
+  *           [CHARGING] ◄───────┐                       │
+  *           ├─ CC 恒流(10A)    │                       │
+  *           ├─ CV 恒压(24V)    │ 异常已消除               │
+  *           ├─ Iout<Icut 充满  │ 软启动恢复               │
+  *           │                 │                       │
+  *           │ Iin>Imax        │                       │
+  *           ▼                 │                       │
+  *      [OC_LOCKOUT] ──► [SOFT_RESTART] ────────────────┘
+  *           │ 重试超限/异常未消除                          │
+  *           ▼                                           │
+  *      [FAULT] ────────────────────────────────────────┘
+  *           │
+  *           ▼
+  *      [OUTPUT_OFF] ─────► [STANDBY]
+  *
+  * ============================================================================
+  *  三、外设资源占用一览
+  * ============================================================================
+  *    ADC1   - 6 通道：母线压/原边流/输出压/输出流/MOSFET温/线圈温
+  *    TIM1   - 高级定时器：85kHz 互补 PWM + 死区 + Break 硬件保护
+  *    USART1 - 与机器人通信 (协议帧带 CRC8)
+  *    IWDG   - 独立看门狗，主循环喂狗，卡死自动复位
+  *    GPIO   - PB0:输出使能 PB1:蜂鸣器 PB12/13/14:三色LED PC13:复位按键
+  *
+  * ============================================================================
+  *  四、参数整定指南（投产前务必标定）
+  * ============================================================================
+  *    1) ADC 标定系数（Sensor_Sample 内的乘数）：用万用表实测 4-5 组数据
+  *       做线性回归，把示例的 *122U / *22U / *10U 替换成实际系数
+  *    2) PI 增益 KP_CC / KI_CC / KP_CV / KI_CV：先用 Z-N 法整定，再现场微调
+  *    3) PWM_FREQ_HZ：必须等于 LCC-S/S-S 谐振槽路的设计频率，否则效率掉得很厉害
+  *    4) U_CV_MV / I_CC_MA / I_CUT_MA：按实际电池规格书填写
+  *    5) PWM_DUTY_MAX：要给死区留余量，全桥不能跑到 50%（硬件会直通短路）
+  *
+  ******************************************************************************
+  */
+
+/* ============================== 头文件 ===================================== */
+#include "stm32f4xx_hal.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdarg.h>     /* Log_Printf 用到的 va_list 等 */
+#include <stdint.h>
+#include <stdbool.h>
+
+/* ============================================================================
+ *                              宏 定 义 区
+ * ============================================================================
+ *  把所有"魔法数字"集中到这里，方便调试时一处改动全局生效。
+ *  规则：用 _MV/_MA/_C/_MS/_HZ 等后缀显式表明物理量纲，避免单位错乱。
+ * ========================================================================== */
+
+/* ----- 母线/原边电气安全阈值（按实际硬件实测整定） ----- */
+#define V_BUS_MIN_MV          (300U * 1000U)   /* 母线电压下限 300V，低于此值认为 PFC 异常 */
+#define V_BUS_MAX_MV          (400U * 1000U)   /* 母线电压上限 400V，超此值立刻关断防器件击穿 */
+#define I_PRI_MAX_MA          (15U * 1000U)    /* 原边线圈电流上限 15A（软件保护层）*/
+#define COMM_TIMEOUT_MS       (1500U)          /* 与机器人通信心跳超时：>1.5s 未收到帧视为掉线 */
+#define CHARGE_TIMEOUT_MS     (3UL * 3600UL * 1000UL) /* 单次充电最长 3h，超时强制结束防失控 */
+
+/* ----- CC-CV 充电参数（对应"充电控制流程图"）----- */
+/*  注：Ubat 由机器人侧通过通信上报到 g_sensor.v_out_mv
+ *      Iout 由机器人侧通过通信上报到 g_sensor.i_out_ma
+ *      也可在基站侧用副边电流估算，本工程为简化采用直接上报值        */
+#define U_CV_MV               (24000U)         /* CV 切换电压 Ucv = 24V (示例：6S 锂电) */
+#define I_CC_MA               (10000U)         /* CC 阶段恒定电流 Iout = 10A */
+#define I_CUT_MA              (500U)           /* 充电截止电流 Icut = 0.5A (≈0.05C) */
+#define I_CUTOFF_MA           I_CUT_MA         /* 兼容旧名 */
+#define V_FULL_MV             U_CV_MV          /* 满电电压等同 Ucv */
+
+/* ----- 二级温度保护（对应"保护逻辑流程图"右图）----- */
+/*  分两级是工程惯例：T1 提示性降额，T2 强制停机
+ *  这样可以在散热裕度还够时持续供电，而不是一过温就停机让用户等 */
+#define TEMP_T1_C             (70)             /* 一级阈值 T1：触发功率降额 */
+#define TEMP_T2_C             (85)             /* 二级阈值 T2：停机保护 */
+#define TEMP_WARN_C           TEMP_T1_C        /* 兼容旧名 */
+#define TEMP_MAX_C            TEMP_T2_C        /* 兼容旧名 */
+#define DERATE_DUTY_FACTOR    (0.70f)          /* 降额时占空比折算系数：上限封顶到 70% */
+
+/* ----- 输入过流锁定 + 延时复检（对应"保护逻辑流程图"主分支）----- */
+/*  锁定→等→重检→恢复 是 WPT 工程的标准做法：避免因瞬态过流（耦合突变、
+ *  机器人微动）频繁报警停机，给一个自愈窗口                       */
+#define I_IN_MAX_MA           (15U * 1000U)    /* 输入电流过流阈值 Imax */
+#define OC_LOCK_DELAY_MS      (2000U)          /* 锁定后 2s 再复检 */
+#define OC_RETRY_LIMIT        (3U)             /* 最多自动恢复 3 次，超过判定永久故障 */
+
+/* ----- PWM / 逆变全桥参数 ----- */
+#define PWM_FREQ_HZ           (85000U)         /* WPT 谐振频率 85kHz (Qi/SAE J2954 主流值) */
+#define PWM_DEAD_TIME_NS      (300U)           /* MOSFET 死区 300ns，防上下桥臂直通 */
+#define PWM_DUTY_DEFAULT      (0.45f)          /* 默认占空比（不能到 50%，要留死区） */
+#define PWM_DUTY_MIN          (0.05f)          /* 占空比下限（再低不足以维持谐振） */
+#define PWM_DUTY_MAX          (0.48f)          /* 占空比上限（硬件安全余量） */
+#define PWM_DUTY_SOFTSTART    (0.10f)          /* 软启动起始占空比，从 10% 开始爬 */
+#define SOFT_START_STEP       (0.02f)          /* 软启动每步增量 2% */
+#define SOFT_START_INTERVAL   (50U)            /* 软启动每步间隔 50ms */
+
+/* ----- CC-CV PI 闭环参数（按实际系统传函整定）----- */
+/*  这里给的是初值，工程中通常用 Ziegler-Nichols 法或临界比例度法整定。
+ *  误差单位是 mA / mV，所以 KP/KI 数值很小是正常的。               */
+#define KP_CC                 (0.00002f)       /* CC 环比例 */
+#define KI_CC                 (0.000002f)      /* CC 环积分 */
+#define KP_CV                 (0.00003f)       /* CV 环比例 */
+#define KI_CV                 (0.000003f)      /* CV 环积分 */
+#define CTRL_PERIOD_MS        (10U)            /* 控制环周期 100Hz，比闭环带宽高 5x 即可 */
+
+/* ----- 数据上报与统计 ----- */
+#define REPORT_PERIOD_MS      (1000U)          /* 状态心跳 1Hz 上报给机器人/上位机 */
+#define ADC_FILTER_DEPTH      (8U)             /* ADC 滑动平均深度，必须是 2 的幂便于位移除法 */
+#define FAULT_HISTORY_DEPTH   (8U)             /* 故障历史环形缓冲深度 */
+
+/* ----- 故障码（按位独立，便于多故障同时上报）----- */
+#define ERR_NONE              0x0000
+#define ERR_SELFTEST_BUS      0x0001           /* 自检：母线异常 */
+#define ERR_SELFTEST_TEMP     0x0002           /* 自检：温度过高 */
+#define ERR_SELFTEST_COIL     0x0004           /* 自检：线圈未到位 */
+#define ERR_SELFTEST_COMM     0x0008           /* 自检：通信不可用 */
+#define ERR_OV_VOLTAGE        0x0010           /* 运行：母线过压 */
+#define ERR_OV_CURRENT        0x0020           /* 运行：原边过流 */
+#define ERR_OV_TEMP           0x0040           /* 运行：温度超 T2 */
+#define ERR_COMM_LOST         0x0080           /* 运行：通信掉线 */
+#define ERR_FOREIGN_OBJECT    0x0100           /* 运行：FOD 异物检测 */
+#define ERR_TIMEOUT           0x0200           /* 运行：充电超时 */
+#define ERR_OC_LOCKED         0x0400           /* 过流锁定后多次重试仍异常 */
+
+/* ============================================================================
+ *                              类 型 定 义 区
+ * ========================================================================== */
+
+/* 系统主状态机（与流程图框一一对应） */
+typedef enum {
+    STATE_INIT = 0,        /* 系统上电初始化           */
+    STATE_STANDBY,         /* 待机检测                 */
+    STATE_REQ_RECEIVED,    /* 接收到充电请求           */
+    STATE_SELF_TEST,       /* 安全自检                 */
+    STATE_INVERTER_ON,     /* 启动逆变输出 (软启动)    */
+    STATE_CHARGING,        /* 充电过程监测 + CC/CV     */
+    STATE_OC_LOCKOUT,      /* 过流锁定 + 延时检测      */
+    STATE_SOFT_RESTART,    /* 异常消除后软启动恢复     */
+    STATE_OUTPUT_OFF,      /* 关闭输出                 */
+    STATE_FAULT,           /* 故障保护 (停机/报警)     */
+    STATE_WAIT_RECOVER     /* 等待恢复                 */
+} sys_state_t;
+
+/* 充电相位子状态（CC-CV 内部状态，用于 Charge_CCCV_Control 决策）*/
+typedef enum {
+    CHG_PHASE_CC = 0,      /* 恒流阶段 (Iout = I_CC_MA) */
+    CHG_PHASE_CV,          /* 恒压阶段 (Vout = U_CV_MV) */
+    CHG_PHASE_DONE         /* Iout < Icut, 充电完成     */
+} chg_phase_t;
+
+/* 传感器数据集 —— 所有 ADC/通信刷新的物理量都汇集到这里
+ * 用 mV/mA 而非 V/A 是为了保持整数运算精度，避免 float 在循环中被频繁调用 */
+typedef struct {
+    uint32_t v_bus_mv;       /* 直流母线电压 mV     */
+    uint32_t v_out_mv;       /* 输出/电池端电压 mV  */
+    uint32_t i_pri_ma;       /* 原边线圈电流 mA     */
+    uint32_t i_out_ma;       /* 输出电流 mA         */
+    int16_t  t_mosfet_c;     /* MOSFET 温度 ℃     */
+    int16_t  t_coil_c;       /* 发射线圈温度 ℃    */
+    uint16_t soc_percent;    /* 机器人电池 SOC      */
+    bool     robot_in_place; /* 机器人到位信号      */
+    bool     comm_ok;        /* 通信链路正常        */
+    uint32_t last_comm_tick; /* 最近一次心跳时刻    */
+} sensor_data_t;
+
+/* ADC 滑动平均滤波器：去掉单次采样毛刺，避免误触发过流保护 */
+typedef struct {
+    uint32_t buf[ADC_FILTER_DEPTH];   /* 历史采样环形缓冲 */
+    uint32_t sum;                     /* 缓冲内累计和   */
+    uint8_t  idx;                     /* 写指针         */
+    bool     filled;                  /* 缓冲是否填满   */
+} adc_filter_t;
+
+/* 故障历史记录（环形缓冲，最近 8 条），方便售后定位问题 */
+typedef struct {
+    uint16_t code;            /* 故障码 */
+    uint32_t tick;            /* 发生时刻 (HAL_GetTick) */
+    int16_t  t_mosfet_c;      /* 故障时温度快照 */
+    uint32_t i_pri_ma;        /* 故障时原边电流快照 */
+} fault_record_t;
+
+/* 状态机上下文（FSM 全部运行时变量集中存放）*/
+typedef struct {
+    /* 状态机基础 */
+    sys_state_t  state;
+    sys_state_t  prev_state;
+    uint16_t     err_flags;
+    uint32_t     state_enter_tick;
+    uint32_t     charge_start_tick;
+    bool         charge_request;
+    bool         stop_request;
+
+    /* CC-CV 控制 */
+    chg_phase_t  phase;
+    float        pwm_duty;            /* 当前占空比，闭环维护 */
+    float        integ_cc;            /* CC 环积分项 */
+    float        integ_cv;            /* CV 环积分项 */
+    uint32_t     last_ctrl_tick;
+
+    /* 二级温度保护 */
+    bool         derate_active;       /* T1 < T < T2: 已降额 */
+
+    /* 过流锁定 + 延时复检 */
+    uint32_t     oc_lock_tick;        /* 进入锁定的时刻 */
+    uint8_t      oc_retry_cnt;        /* 累计重试次数 */
+
+    /* 充电统计 */
+    uint64_t     energy_uwh;          /* 累计输出能量，单位 μWh，避免溢出 */
+    uint32_t     last_stat_tick;      /* 上次统计积分的时刻 */
+    uint32_t     last_report_tick;    /* 上次心跳上报的时刻 */
+
+    /* 故障历史 */
+    fault_record_t fault_hist[FAULT_HISTORY_DEPTH];
+    uint8_t        fault_hist_idx;
+} fsm_ctx_t;
+
+/* ============================== 全局对象 =================================== */
+static sensor_data_t g_sensor;
+static fsm_ctx_t     g_fsm;
+static adc_filter_t  g_filt[6];   /* 对应 6 个 ADC 通道，独立滤波 */
+
+/* HAL 句柄（实际工程由 CubeMX 生成，这里 extern 引用）*/
+extern ADC_HandleTypeDef  hadc1;
+extern TIM_HandleTypeDef  htim1;     /* 高级定时器，互补 PWM */
+extern UART_HandleTypeDef huart1;    /* 与机器人 UART 通信   */
+extern IWDG_HandleTypeDef hiwdg;
+
+/* ============================== 函数前向声明 =============================== */
+static void   System_Init(void);
+static void   FSM_Run(void);
+static void   FSM_Goto(sys_state_t s);
+
+static uint32_t ADC_FilterPush(adc_filter_t *f, uint32_t raw);
+static uint32_t ADC_ReadChannel(uint32_t ch);
+static void   Sensor_Sample(void);
+
+static bool   Comm_CheckRequest(void);
+static uint8_t Comm_CRC8(const uint8_t *data, uint8_t len);
+static void   Comm_ReportStatus(void);
+
+static bool   SelfTest_Run(uint16_t *err);
+
+static void   Inverter_Start(void);
+static void   Inverter_SoftStart_Step(void);
+static void   Inverter_Stop(void);
+static void   Inverter_SetDuty(float duty);
+
+static bool   Charge_IsComplete(void);
+static void   Charge_CCCV_Control(void);
+static bool   Charge_DetectAbnormal(uint16_t *err);
+static void   Charge_AccumulateEnergy(void);
+static void   Power_Derate(bool on);
+
+static void   Fault_Trigger(uint16_t err);
+static void   Fault_Record(uint16_t err);
+static bool   Fault_TryRecover(void);
+
+static void   Buzzer_Alarm(bool on);
+static void   LED_SetState(sys_state_t s);
+static void   Log_Printf(const char *fmt, ...);
+
+/* ============================================================================
+ *                              主 函 数 main
+ * ============================================================================
+ *  超循环结构：每轮喂狗 → 采样 → FSM → 上报 → 短延时
+ *  延时 2ms 给主循环约 500Hz 节拍，闭环 100Hz、上报 1Hz 都通过 tick 计数实现
+ * ========================================================================== */
+int main(void)
 {
-  "exported_at": "2026-05-26T13:33:16+08:00",
-  "proxies": [],
-  "accounts": [
+    HAL_Init();             /* HAL 库初始化（SysTick、NVIC 优先级分组）*/
+    System_Init();          /* 时钟/外设/默认安全状态                  */
+
+    g_fsm.state = STATE_INIT;
+    FSM_Goto(STATE_STANDBY);    /* 上电后立刻进入待机检测 */
+
+    while (1)
     {
-      "name": "Adolfozeltwanger0664+phviif",
-      "platform": "openai",
-      "type": "oauth",
-      "concurrency": 10,
-      "priority": 1,
-      "credentials": {
-        "access_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6IjE5MzQ0ZTY1LWJiYzktNDRkMS1hOWQwLWY5NTdiMDc5YmQwZSIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS92MSJdLCJjbGllbnRfaWQiOiJhcHBfRU1vYW1FRVo3M2YwQ2tYYVhwN2hyYW5uIiwiZXhwIjoxNzgwNjAyNTUzLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiYW1yIjpbInB3ZCJdLCJjaGF0Z3B0X2NvbXB1dGVfcmVzaWRlbmN5Ijoibm9fY29uc3RyYWludCIsImNoYXRncHRfZGF0YV9yZXNpZGVuY3kiOiJub19jb25zdHJhaW50IiwibG9jYWxob3N0Ijp0cnVlLCJ1c2VyX2lkIjoidXNlci1rOGNJUThBbjZROEdRT3ljWnRRTXYwMmsifSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9wcm9maWxlIjp7ImVtYWlsIjoiQWRvbGZvWmVsdHdhbmdlcjA2NjQrcGhWaWlGQG91dGxvb2suY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWV9LCJpYXQiOjE3Nzk3Mzg1NTMsImlzcyI6Imh0dHBzOi8vYXV0aC5vcGVuYWkuY29tIiwianRpIjoiNjhiYmE4OTItY2FlMi00MGNhLTk4ZjUtNDg0MDMyMTY2M2JhIiwibmJmIjoxNzc5NzM4NTUzLCJwd2RfYXV0aF90aW1lIjoxNzc5NzM4NTQ3MTA2LCJzY3AiOlsib3BlbmlkIiwicHJvZmlsZSIsImVtYWlsIiwib2ZmbGluZV9hY2Nlc3MiLCJhcGkuY29ubmVjdG9ycy5yZWFkIiwiYXBpLmNvbm5lY3RvcnMuaW52b2tlIl0sInNlc3Npb25faWQiOiJhdXRoc2Vzc18xQVJrZVA5YzZJSk5IMnFCVnhLbTlONVUiLCJzbCI6dHJ1ZSwic3ViIjoiYXV0aDB8S0xBZDA1VUxhcjhYN0Y5alhwVVFXOGV1In0.Rf_fUNQdx9X_ao-s3Y_PQgM5jfKkupiKN6CSJw3zB1iTcClqmEZwgjLlb1hkn6kxsjw6jpXq3L545qQJQcPzhgnwY4IMHF809N3o10-BPRI9_Kk-tgETxuKUenrQMmdFMKhrMGEZ_2yfrxJfyV-1EplRT9X5uxS1BQfHFCN_FB-OXmDe2VqEvMRKOJAoykSO-NWD08qFesm8Xtz6kDKwTDSdsU18Wc1Taf1k3q2HtX31LMG1PB6pZCiDhMKVSeSKg3rVrudjLw_NogyJsxkzo4qA3QVQm_i72yAtnWooEdH8elJQl31fF7LlEPq484upcaeY3kPXlml8dArGeyuLA79EPhXa_UIp9mFfZdRpl7FcEoejLTD1a1nABlHTVMfN7mAYODDZnD88c2aqT3d-xOOjPNk59gigMIbCiocLKzrtbp2-xSrXTwlSjyRfCHCKZ-8TRoVZCLOj7W8NatbCkiLbZv6zrKOg-jSkYtSbMb4cU-sXoqWLUmCJeynK2JfZt_wW_TczJy3CAFslXr7gS9WOH-pfgdBIo8hAJOFEMXxrdS2kamr9Z6sY5EZxD95lpZrt0LoGoiBwh1Wgmzg3BxfC8ImtKmwdsAtpxfqzNt8ikMg2eo7a5tzYDrtcH_d4IyaJRcp35167fw3tRcV0Ktlt73_QfNE8q8Uq_-1XphI",
-        "refresh_token": "rt_lsmIPBfauwsBCMKCnhmr9kgTVJIXgwhzh1OxP-_A-XA.yLCYsBZ4SSbZDi4Sr5DjsjIKQLNdg-cEqOQkxpG4xkk",
-        "id_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImIxZGQzZjhmLTlhYWQtNDdmZS1iMGU3LWVkYjAwOTc3N2Q2YiIsInR5cCI6IkpXVCJ9.eyJhbXIiOlsicHdkIl0sImF0X2hhc2giOiJYcUxiYnJVLTBpTHJlT3l4WWpZTnRBIiwiYXVkIjpbImFwcF9FTW9hbUVFWjczZjBDa1hhWHA3aHJhbm4iXSwiYXV0aF9wcm92aWRlciI6InBhc3N3b3JkIiwiYXV0aF90aW1lIjoxNzc5NzM4NTQ3LCJlbWFpbCI6IkFkb2xmb1plbHR3YW5nZXIwNjY0K3BoVmlpRkBvdXRsb29rLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJleHAiOjE3Nzk3NDIxNTMsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJncm91cHMiOltdLCJsb2NhbGhvc3QiOnRydWUsIm9yZ2FuaXphdGlvbnMiOlt7ImlkIjoib3JnLWZqRUpCWEFvdkZET0RtVDFuc1YyTG5HWSIsImlzX2RlZmF1bHQiOnRydWUsInJvbGUiOiJvd25lciIsInRpdGxlIjoiUGVyc29uYWwifV0sInVzZXJfaWQiOiJ1c2VyLWs4Y0lROEFuNlE4R1FPeWNadFFNdjAyayJ9LCJpYXQiOjE3Nzk3Mzg1NTMsImlzcyI6Imh0dHBzOi8vYXV0aC5vcGVuYWkuY29tIiwianRpIjoiNzgxZWRhZWYtOTgxYi00M2M5LTkyZjktMDNhZDQ0ZTczYWRiIiwibmFtZSI6Ikx5ZGlhIERhd3NvbiIsInJhdCI6MTc3OTczODQ5Miwic2lkIjoiM2FkZmM0MjUtNzNhMS00MDYzLTkwZTktYmU2MzhjMWU2YjE1Iiwic3ViIjoiYXV0aDB8S0xBZDA1VUxhcjhYN0Y5alhwVVFXOGV1In0.JvkYpLW4LUDuX5X9HMrCjdchJP32CvbkUXdRvnQOuPkKBcPqLhzwjZXQtSMBLukgUo8BCVqBrIOasrxt-zD0Qou-kKXz74ydFq6MuEYqq4Byi6SI16_ov1lPtqibVBOhYqvqnAgT04SCb4KfJgq8rtk-SH_brtWKmi7xKNPiIA1OaHTmy-BYtGiZXZ5TPlyMQrVeL2vlVrkVkId-IcZykXsMSkCfa9Ckensoyih-QTp5BeUEHBPSO6uiRaz0j2cjWjGrCHbUB3OwPGlmAuTwdkNyENboo1LQIhiTqOQUsjeWg5emI-Bsq8JRK8KWM1k5mPZhz4U7SgTaF3F0yJ27S9tzVOALq0rnS3k4eDixVZGFC8-RrmhyvJadaS09a81jbXQeZ3XULm6iibCWW8F09z-Dk3jP4kjUmsHZAo3vUC2o9kpei69gOeDV1xJC00XL_z3kMZS3Uc7bRo40RY4REscKohyxFYqJNXLY3SQxJ17zSBtIqZJ-RecWDBhyNkz3UmtgP7Pi1Uiu-vBZaP7OIe46qqZ04iIrV_NXDZ4R70_BpmTCnY_FoHkHmwypYeao6sQR77i30-vGgWBmOd2Ad_tmFtBYf8D8fu_-3mTq3IC19NE7lrPxtC0kmJChZkPLTLismjNF2AklyfCqzzwvt-gUEHAspfWxczvC_9umTcI",
-        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
-        "account_id": "43e74ba7-ddcd-4db7-8887-e75d00a4052c",
-        "chatgpt_account_id": "43e74ba7-ddcd-4db7-8887-e75d00a4052c",
-        "chatgpt_user_id": "user-k8cIQ8An6Q8GQOycZtQMv02k",
-        "workspace_id": "43e74ba7-ddcd-4db7-8887-e75d00a4052c",
-        "organization_id": "org-fjEJBXAovFDODmT1nsV2LnGY",
-        "email": "adolfozeltwanger0664+phviif@outlook.com",
-        "expires_at": 1780602553,
-        "expires_in": 864000,
-        "plan_type": "plus"
-      },
-      "extra": {
-        "email": "adolfozeltwanger0664+phviif@outlook.com",
-        "email_key": "adolfozeltwanger0664+phviif@outlook.com",
-        "name": "Adolfozeltwanger0664+phviif",
-        "source": "go-pool",
-        "last_refresh": "2026-05-26T13:33:16+08:00"
-      }
+        HAL_IWDG_Refresh(&hiwdg);   /* 喂独立看门狗：超时 0.5s 不喂自动复位 */
+        Sensor_Sample();            /* 持续刷新所有传感器（ADC + 通信状态）*/
+        FSM_Run();                  /* 主状态机推进 */
+        Comm_ReportStatus();        /* 1Hz 心跳上报当前状态给机器人 */
+        HAL_Delay(2);               /* 主循环节拍 ~500Hz，留 CPU 给中断 */
     }
-  ]
+}
+
+/* ============================================================================
+ *                              系 统 初 始 化
+ * ========================================================================== */
+static void System_Init(void)
+{
+    /* 这些函数由 CubeMX 自动生成，包含时钟树、GPIO 复用、外设参数等   */
+    extern void SystemClock_Config(void);
+    extern void MX_GPIO_Init(void);
+    extern void MX_ADC1_Init(void);
+    extern void MX_TIM1_Init(void);
+    extern void MX_USART1_UART_Init(void);
+    extern void MX_IWDG_Init(void);
+
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_ADC1_Init();
+    MX_TIM1_Init();
+    MX_USART1_UART_Init();
+    MX_IWDG_Init();
+
+    /* 上电默认安全态：逆变关闭、继电器断开、报警关闭
+     * 注意：这一步必须在状态机启动前调用，确保任何异常下硬件都是安全的 */
+    Inverter_Stop();
+    Buzzer_Alarm(false);
+
+    /* 全部全局变量清零，避免 BSS 段不归零的平台带来未定义行为 */
+    memset(&g_sensor, 0, sizeof(g_sensor));
+    memset(&g_fsm,    0, sizeof(g_fsm));
+    memset(&g_filt,   0, sizeof(g_filt));
+
+    Log_Printf("[BOOT] Wireless Charging Station Ready, FW=v1.2\r\n");
+}
+
+/* ============================================================================
+ *                              状 态 机 核 心
+ * ============================================================================
+ *  设计原则：
+ *  1) 每个状态只做"该状态自己负责的事"，跳转通过 FSM_Goto 显式声明
+ *  2) 状态进入时记录 state_enter_tick，方便实现"在该状态停留 X 秒"的逻辑
+ *  3) 所有状态都能被异常打断（异常一律走到 FAULT 分支）
+ * ========================================================================== */
+static void FSM_Goto(sys_state_t s)
+{
+    g_fsm.prev_state       = g_fsm.state;
+    g_fsm.state            = s;
+    g_fsm.state_enter_tick = HAL_GetTick();
+    LED_SetState(s);
+    Log_Printf("[FSM] %d -> %d\r\n", g_fsm.prev_state, s);
+}
+
+static void FSM_Run(void)
+{
+    uint16_t err = ERR_NONE;
+
+    switch (g_fsm.state)
+    {
+    /* ======== 待机检测 ======== */
+    /* 等待机器人就位并发起充电请求；逆变保持关闭，整机低功耗 */
+    case STATE_STANDBY:
+        Inverter_Stop();
+        if (Comm_CheckRequest()) {              /* 收到充电请求? */
+            g_fsm.charge_request = true;
+            FSM_Goto(STATE_REQ_RECEIVED);
+        }
+        break;
+
+    /* ======== 接收充电请求 ======== */
+    /* 这里只是个过渡状态，作用是打印 log + 让 LED 闪一下，
+     * 表明已正式受理本次充电任务，方便现场调试观察             */
+    case STATE_REQ_RECEIVED:
+        Log_Printf("[REQ] charge request accepted, SOC=%u%%\r\n",
+                    g_sensor.soc_percent);
+        FSM_Goto(STATE_SELF_TEST);
+        break;
+
+    /* ======== 安全自检 ======== */
+    /* 在打开高压之前，先检查所有"前提条件"是否满足：
+     *   母线电压在范围、温度正常、机器人在位、通信正常
+     * 任何一项不满足都进入 FAULT，绝不带病作业 */
+    case STATE_SELF_TEST:
+        if (SelfTest_Run(&err)) {
+            FSM_Goto(STATE_INVERTER_ON);
+        } else {
+            Fault_Trigger(err);
+        }
+        break;
+
+    /* ======== 启动逆变输出（软启动） ======== */
+    /* 软启动让占空比从 10% 渐升到 45%，避免线圈电流冲击。
+     * 同时把 CC-CV 上下文复位（积分清零、相位回到 CC）       */
+    case STATE_INVERTER_ON:
+        Inverter_Start();
+        g_fsm.charge_start_tick = HAL_GetTick();
+        g_fsm.last_stat_tick    = HAL_GetTick();
+        g_fsm.energy_uwh        = 0;
+        g_fsm.phase             = CHG_PHASE_CC;
+        g_fsm.integ_cc          = 0.0f;
+        g_fsm.integ_cv          = 0.0f;
+        g_fsm.derate_active     = false;
+        g_fsm.last_ctrl_tick    = HAL_GetTick();
+        FSM_Goto(STATE_CHARGING);
+        break;
+
+    /* ======== 充电过程监测 + CC-CV 控制（左图核心流程）======== */
+    /* 这是整个程序的"工作"状态，每个主循环都会做 4 件事：
+     *   ① 软启动爬坡（如果还在爬坡阶段）
+     *   ② 异常检测（过流走 OC_LOCKOUT 软恢复，其它走 FAULT 硬故障）
+     *   ③ CC-CV 闭环控制（每 10ms 跑一次，保持 Iout=10A 或 Vout=24V）
+     *   ④ 电量累计 + 充满判定                                     */
+    case STATE_CHARGING:
+        /* ① 软启动单步推进（已到目标值会自动 return）*/
+        Inverter_SoftStart_Step();
+
+        /* ② 异常分级处理 */
+        if (Charge_DetectAbnormal(&err)) {
+            if (err & ERR_OV_CURRENT) {          /* Iin > Imax: 锁定+延时复检 */
+                Inverter_Stop();
+                g_fsm.err_flags  = err;
+                g_fsm.oc_lock_tick = HAL_GetTick();
+                Fault_Record(err);               /* 记录到故障历史 */
+                Log_Printf("[OC] lockout, retry=%u/%u\r\n",
+                           g_fsm.oc_retry_cnt, OC_RETRY_LIMIT);
+                FSM_Goto(STATE_OC_LOCKOUT);
+                break;
+            }
+            /* 其它硬故障(T>T2、通信丢失、FOD、超时) -> 直接故障保护 */
+            Fault_Trigger(err);
+            break;
+        }
+
+        /* ③ CC-CV 闭环控制（按相位调整占空比）
+         *    用 tick 差值实现 100Hz 节拍，主循环不必精确等周期      */
+        if ((HAL_GetTick() - g_fsm.last_ctrl_tick) >= CTRL_PERIOD_MS) {
+            g_fsm.last_ctrl_tick = HAL_GetTick();
+            Charge_CCCV_Control();
+        }
+
+        /* ④ 充电量累计（用作能耗统计/计费）*/
+        Charge_AccumulateEnergy();
+
+        /* ⑤ 充满或停充判定 */
+        if (Charge_IsComplete() || g_fsm.stop_request) {
+            FSM_Goto(STATE_OUTPUT_OFF);
+        }
+        break;
+
+    /* ======== 过流锁定 + 延时检测（右图分支）======== */
+    /* 已经把 PWM 关掉，现在等 2 秒看现场异常是否消退；
+     * 消退则尝试软启动恢复，连续 3 次还是异常就判定永久故障    */
+    case STATE_OC_LOCKOUT:
+        if ((HAL_GetTick() - g_fsm.oc_lock_tick) >= OC_LOCK_DELAY_MS) {
+            bool still_abnormal =
+                (g_sensor.i_pri_ma > I_IN_MAX_MA) ||
+                (g_sensor.t_mosfet_c > TEMP_T2_C) ||
+                (g_sensor.t_coil_c   > TEMP_T2_C);
+
+            if (!still_abnormal) {
+                g_fsm.oc_retry_cnt++;
+                if (g_fsm.oc_retry_cnt > OC_RETRY_LIMIT) {
+                    /* 超过重试上限 -> 保持闭锁，禁止启动，报警上报 */
+                    Fault_Trigger(ERR_OC_LOCKED);
+                } else {
+                    Log_Printf("[OC] cleared, soft restart\r\n");
+                    FSM_Goto(STATE_SOFT_RESTART);
+                }
+            } else {
+                /* 异常未消除 -> 闭锁报警 */
+                Fault_Trigger(g_fsm.err_flags | ERR_OC_LOCKED);
+            }
+        }
+        break;
+
+    /* ======== 软启动恢复（异常已消除分支）======== */
+    /* 重新使能逆变并从低占空比起步，PI 积分清零防止积分饱和  */
+    case STATE_SOFT_RESTART:
+        Inverter_Start();
+        g_fsm.phase          = CHG_PHASE_CC;
+        g_fsm.integ_cc       = 0.0f;
+        g_fsm.integ_cv       = 0.0f;
+        g_fsm.last_ctrl_tick = HAL_GetTick();
+        FSM_Goto(STATE_CHARGING);
+        break;
+
+    /* ======== 关闭输出 ======== */
+    /* 充电正常结束的退出路径，关 PWM、关使能、清标志、回到待机 */
+    case STATE_OUTPUT_OFF:
+        Inverter_Stop();
+        g_fsm.charge_request = false;
+        g_fsm.stop_request   = false;
+        Log_Printf("[DONE] V=%lumV I=%lumA Energy=%lumWh\r\n",
+                    g_sensor.v_out_mv, g_sensor.i_out_ma,
+                    (uint32_t)(g_fsm.energy_uwh / 1000ULL));
+        FSM_Goto(STATE_STANDBY);
+        break;
+
+    /* ======== 故障保护（停机/报警）======== */
+    /* 任何故障的统一入口，一定要做的两件事：关功率 + 鸣警  */
+    case STATE_FAULT:
+        Inverter_Stop();
+        Buzzer_Alarm(true);
+        Fault_Record(g_fsm.err_flags);
+        FSM_Goto(STATE_WAIT_RECOVER);
+        break;
+
+    /* ======== 等待恢复 ======== */
+    /* 故障消除（温度回落 + 母线正常 + 复位按钮）后回到待机   */
+    case STATE_WAIT_RECOVER:
+        if (Fault_TryRecover()) {
+            Buzzer_Alarm(false);
+            g_fsm.err_flags    = ERR_NONE;
+            g_fsm.oc_retry_cnt = 0;             /* 清零过流重试计数 */
+            FSM_Goto(STATE_STANDBY);
+        }
+        break;
+
+    default:
+        FSM_Goto(STATE_STANDBY);
+        break;
+    }
+}
+
+/* ============================================================================
+ *                              传 感 器 采 样
+ * ============================================================================
+ *  ADC 采样 + 滑动平均滤波 + 物理量换算
+ *  滤波是必须的：开关电源高频电磁干扰会让单次 ADC 值飘 ±5%，
+ *  不滤波很容易把毛刺当成过流，触发"莫名其妙的保护"   */
+/* ========================================================================== */
+
+/* 滑动平均滤波器：每来一个新值，替换最老的值，重新计算平均
+ * 复杂度 O(1)，不需要每次重新求和。深度=8，平均下来抑制 ~9dB 噪声 */
+static uint32_t ADC_FilterPush(adc_filter_t *f, uint32_t raw)
+{
+    if (!f->filled) {
+        /* 初次填充阶段：累加 */
+        f->sum += raw;
+        f->buf[f->idx] = raw;
+        f->idx++;
+        if (f->idx >= ADC_FILTER_DEPTH) {
+            f->filled = true;
+            f->idx = 0;
+        }
+        return f->sum / (f->idx ? f->idx : 1);
+    }
+    /* 已填满：减去最老值，加新值 */
+    f->sum -= f->buf[f->idx];
+    f->sum += raw;
+    f->buf[f->idx] = raw;
+    f->idx = (f->idx + 1) & (ADC_FILTER_DEPTH - 1);  /* 位与代替取模 */
+    return f->sum / ADC_FILTER_DEPTH;
+}
+
+/* 单通道阻塞式采样，5ms 超时
+ * 注意：阻塞式只在采样率不高时可用，更高频建议用 DMA + ADC 多通道扫描 */
+static uint32_t ADC_ReadChannel(uint32_t ch)
+{
+    ADC_ChannelConfTypeDef cfg = {0};
+    cfg.Channel      = ch;
+    cfg.Rank         = 1;
+    cfg.SamplingTime = ADC_SAMPLETIME_15CYCLES;
+    HAL_ADC_ConfigChannel(&hadc1, &cfg);
+    HAL_ADC_Start(&hadc1);
+    if (HAL_ADC_PollForConversion(&hadc1, 5) == HAL_OK) {
+        return HAL_ADC_GetValue(&hadc1);
+    }
+    return 0;
+}
+
+/* 周期性刷新所有传感器到 g_sensor，主循环每 2ms 调一次。
+ * ADC 标定系数（*122 / *22 / *10）需按实际硬件分压电阻和霍尔传感器灵敏度修正 */
+static void Sensor_Sample(void)
+{
+    /* 6 通道原始 ADC 值 */
+    uint32_t raw[6];
+    raw[0] = ADC_ReadChannel(ADC_CHANNEL_0);   /* 母线电压 */
+    raw[1] = ADC_ReadChannel(ADC_CHANNEL_1);   /* 原边电流 */
+    raw[2] = ADC_ReadChannel(ADC_CHANNEL_2);   /* 输出电压 */
+    raw[3] = ADC_ReadChannel(ADC_CHANNEL_3);   /* 输出电流 */
+    raw[4] = ADC_ReadChannel(ADC_CHANNEL_4);   /* MOSFET 温度 */
+    raw[5] = ADC_ReadChannel(ADC_CHANNEL_5);   /* 线圈温度 */
+
+    /* 经过滑动平均滤波 */
+    uint32_t f0 = ADC_FilterPush(&g_filt[0], raw[0]);
+    uint32_t f1 = ADC_FilterPush(&g_filt[1], raw[1]);
+    uint32_t f2 = ADC_FilterPush(&g_filt[2], raw[2]);
+    uint32_t f3 = ADC_FilterPush(&g_filt[3], raw[3]);
+    uint32_t f4 = ADC_FilterPush(&g_filt[4], raw[4]);
+    uint32_t f5 = ADC_FilterPush(&g_filt[5], raw[5]);
+
+    /* 12bit ADC, Vref=3.3V (3300mV), 量程 4096
+     * 换算公式：mV = raw * 3300 / 4096 * 分压比                  */
+    g_sensor.v_bus_mv    = (f0 * 3300U / 4096U) * 122U;   /* 1:121 分压示例 */
+    g_sensor.v_out_mv    = (f2 * 3300U / 4096U) * 22U;
+    g_sensor.i_pri_ma    = (f1 * 3300U / 4096U) * 10U;    /* 霍尔灵敏度示例 */
+    g_sensor.i_out_ma    = (f3 * 3300U / 4096U) * 10U;
+    g_sensor.t_mosfet_c  = (int16_t)((f4 * 3300 / 4096 - 500) / 10); /* LM35 */
+    g_sensor.t_coil_c    = (int16_t)((f5 * 3300 / 4096 - 500) / 10);
+
+    /* 通信心跳超时检测 */
+    if ((HAL_GetTick() - g_sensor.last_comm_tick) > COMM_TIMEOUT_MS) {
+        g_sensor.comm_ok = false;
+    }
+}
+
+/* ============================================================================
+ *                              通 信 (与机器人)
+ * ============================================================================
+ *  协议帧格式（固定 8 字节）：
+ *    Byte0: 帧头 0xAA
+ *    Byte1: 帧头 0x55
+ *    Byte2: 命令字 (0x01=请求充电 0x02=请求停充 0x10=机器人状态)
+ *    Byte3-4: SOC (大端)
+ *    Byte5: 标志位 (bit0=机器人到位)
+ *    Byte6: 保留
+ *    Byte7: CRC8 (Byte0~Byte6 的 CRC8/MAXIM)
+ *  CRC 校验非常关键：充电站工作环境噪声大，没有 CRC 容易被干扰误指令       */
+/* ========================================================================== */
+
+/* CRC8/MAXIM 多项式 0x31，工业现场通用，硬件 OneWire 也是这个 */
+static uint8_t Comm_CRC8(const uint8_t *data, uint8_t len)
+{
+    uint8_t crc = 0x00;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t b = 0; b < 8; b++) {
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+static bool Comm_CheckRequest(void)
+{
+    /* 简化：以机器人到位 + 充电请求帧 共同判定。
+     * 任一不满足都不开机，避免空载逆变（无负载会损坏 MOSFET）  */
+    return (g_sensor.robot_in_place && g_fsm.charge_request);
+}
+
+/* 1Hz 心跳上报：把当前状态、电压电流、温度、累计电量打包发给机器人。
+ * 机器人根据这个数据决定是否继续充电、是否需要远程停止                 */
+static void Comm_ReportStatus(void)
+{
+    if ((HAL_GetTick() - g_fsm.last_report_tick) < REPORT_PERIOD_MS) return;
+    g_fsm.last_report_tick = HAL_GetTick();
+
+    uint8_t frame[16];
+    frame[0]  = 0xAA;
+    frame[1]  = 0x55;
+    frame[2]  = 0x80;                                    /* 状态上报命令字 */
+    frame[3]  = (uint8_t)g_fsm.state;
+    frame[4]  = (uint8_t)g_fsm.phase;
+    frame[5]  = (uint8_t)(g_sensor.v_out_mv >> 8);
+    frame[6]  = (uint8_t)(g_sensor.v_out_mv & 0xFF);
+    frame[7]  = (uint8_t)(g_sensor.i_out_ma >> 8);
+    frame[8]  = (uint8_t)(g_sensor.i_out_ma & 0xFF);
+    frame[9]  = (uint8_t)g_sensor.t_mosfet_c;
+    frame[10] = (uint8_t)g_sensor.t_coil_c;
+    frame[11] = (uint8_t)(g_fsm.err_flags >> 8);
+    frame[12] = (uint8_t)(g_fsm.err_flags & 0xFF);
+    frame[13] = g_fsm.derate_active ? 1 : 0;
+    frame[14] = (uint8_t)(g_fsm.energy_uwh / 1000000ULL); /* Wh 整数部分 */
+    frame[15] = Comm_CRC8(frame, 15);
+
+    HAL_UART_Transmit(&huart1, frame, sizeof(frame), 50);
+}
+
+/* UART 接收中断回调：按字节累积，凑齐 8 字节后校验 CRC，
+ * 通过则更新 g_sensor。有任何字节出错整帧丢弃，下次重新对齐帧头     */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    static uint8_t  rx_byte;
+    static uint8_t  buf[8];
+    static uint8_t  idx = 0;
+
+    if (huart->Instance == USART1) {
+        buf[idx++] = rx_byte;
+
+        /* 没对齐到帧头 0xAA 就一直右移丢弃，直到等到帧头才开始累积 */
+        if (idx == 1 && buf[0] != 0xAA) { idx = 0; }
+        else if (idx == 2 && buf[1] != 0x55) { idx = 0; }
+        else if (idx >= 8) {
+            idx = 0;
+            /* 校验 CRC */
+            if (Comm_CRC8(buf, 7) == buf[7]) {
+                uint8_t cmd = buf[2];
+                g_sensor.soc_percent    = ((uint16_t)buf[3] << 8) | buf[4];
+                g_sensor.robot_in_place = (buf[5] & 0x01) ? true : false;
+                g_sensor.comm_ok        = true;
+                g_sensor.last_comm_tick = HAL_GetTick();
+
+                if (cmd == 0x01) g_fsm.charge_request = true;   /* 请求充电 */
+                if (cmd == 0x02) g_fsm.stop_request   = true;   /* 请求停充 */
+                /* 0x10 是状态帧（不带命令），只更新数据不触发动作 */
+            }
+            /* CRC 不通过时静默丢弃，不报错（噪声环境正常现象）*/
+        }
+        HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+    }
+}
+
+/* ============================================================================
+ *                              安 全 自 检
+ * ============================================================================
+ *  在打开高压前的"通电前体检"，比运行时的异常检测更严格：
+ *  运行时温度只看 T2，自检时连 T1 都不能超                          */
+/* ========================================================================== */
+static bool SelfTest_Run(uint16_t *err)
+{
+    *err = ERR_NONE;
+
+    if (g_sensor.v_bus_mv < V_BUS_MIN_MV || g_sensor.v_bus_mv > V_BUS_MAX_MV)
+        *err |= ERR_SELFTEST_BUS;
+
+    if (g_sensor.t_mosfet_c > TEMP_T1_C || g_sensor.t_coil_c > TEMP_T1_C)
+        *err |= ERR_SELFTEST_TEMP;
+
+    if (!g_sensor.robot_in_place)
+        *err |= ERR_SELFTEST_COIL;     /* 严格说应叫"耦合检测"，机器人未到位本质就是耦合不上 */
+
+    if (!g_sensor.comm_ok)
+        *err |= ERR_SELFTEST_COMM;
+
+    return (*err == ERR_NONE);
+}
+
+/* ============================================================================
+ *                              逆 变 启 停 / 软 启 动
+ * ============================================================================
+ *  全桥逆变器的启停必须遵守严格顺序：
+ *    启：先设占空比 → 再启 PWM → 最后给硬件使能
+ *    停：先撤硬件使能 → 再停 PWM
+ *  否则有可能在使能那一瞬间 PWM 还没准备好，输出乱跳，烧 MOSFET    */
+/* ========================================================================== */
+
+/* 设置占空比：带边界保护 + 降额封顶 */
+static void Inverter_SetDuty(float duty)
+{
+    if (duty < PWM_DUTY_MIN) duty = PWM_DUTY_MIN;
+    if (duty > PWM_DUTY_MAX) duty = PWM_DUTY_MAX;
+    /* 降额状态下额外封顶到 PWM_DUTY_MAX * 70%，保护过热场景 */
+    if (g_fsm.derate_active && duty > PWM_DUTY_MAX * DERATE_DUTY_FACTOR) {
+        duty = PWM_DUTY_MAX * DERATE_DUTY_FACTOR;
+    }
+    uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim1);
+    /* 通道 1 和 2 同步设置（全桥两个对角桥臂）*/
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)((arr + 1U) * duty));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)((arr + 1U) * duty));
+    g_fsm.pwm_duty = duty;
+}
+
+/* 启动逆变：从 PWM_DUTY_SOFTSTART (10%) 起步，避免冲击 */
+static void Inverter_Start(void)
+{
+    /* 计算 ARR：PCLK2 经定时器分频后等于 PWM_FREQ_HZ
+     * STM32F407 默认 PCLK2 = 84MHz，ARR = 84M*2/85k - 1 ≈ 1976 */
+    uint32_t arr = (HAL_RCC_GetPCLK2Freq() * 2U) / PWM_FREQ_HZ - 1U;
+    __HAL_TIM_SET_AUTORELOAD(&htim1, arr);
+
+    g_fsm.pwm_duty = PWM_DUTY_SOFTSTART;
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1,
+                          (uint32_t)((arr + 1U) * PWM_DUTY_SOFTSTART));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2,
+                          (uint32_t)((arr + 1U) * PWM_DUTY_SOFTSTART));
+
+    /* 主从两路互补 PWM 启动 */
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
+
+    /* 最后给硬件使能（全桥驱动芯片 enable 脚），顺序不能颠倒 */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+    Log_Printf("[INV] soft start @ %uHz, duty=%d%%\r\n",
+               PWM_FREQ_HZ, (int)(PWM_DUTY_SOFTSTART * 100));
+}
+
+/* 软启动单步：每 SOFT_START_INTERVAL ms 抬升 SOFT_START_STEP，
+ * 直到达到 PWM_DUTY_DEFAULT 后由 CC-CV 闭环接管               */
+static void Inverter_SoftStart_Step(void)
+{
+    static uint32_t last_step_tick = 0;
+    if (g_fsm.pwm_duty >= PWM_DUTY_DEFAULT) return;
+    if ((HAL_GetTick() - last_step_tick) < SOFT_START_INTERVAL) return;
+    last_step_tick = HAL_GetTick();
+
+    float d = g_fsm.pwm_duty + SOFT_START_STEP;
+    if (d > PWM_DUTY_DEFAULT) d = PWM_DUTY_DEFAULT;
+    Inverter_SetDuty(d);
+}
+
+/* 关闭逆变：先撤使能（最重要，先确保没电流再停 PWM）*/
+static void Inverter_Stop(void)
+{
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
+    HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
+    HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_2);
+}
+
+/* ============================================================================
+ *                              CC-CV 闭 环 控 制（左 图 核 心）
+ * ============================================================================
+ *  控制律：典型 PI 增量式
+ *    duty(k) = duty(k-1) + KP*err + KI*∫err·dt
+ *
+ *  分两个相位：
+ *    CC（恒流）：err = I_CC_MA - i_out_ma；目标维持 10A
+ *                Iout 偏低 → err > 0 → duty 增大 → 输出功率增加 → Iout 回升
+ *    CV（恒压）：err = U_CV_MV - v_out_mv；目标维持 24V
+ *                Vout 偏低 → err > 0 → duty 增大 → 输出电压回升
+ *  抗积分饱和：积分项手动钳位，防止上电瞬间或大跳变时积分爆炸
+ * ========================================================================== */
+static void Charge_CCCV_Control(void)
+{
+    uint32_t ubat = g_sensor.v_out_mv;
+    uint32_t iout = g_sensor.i_out_ma;
+
+    /* ① 相位切换判定（左图：菱形判断框 Ubat 达到 Ucv?）*/
+    if (g_fsm.phase == CHG_PHASE_CC && ubat >= U_CV_MV) {
+        g_fsm.phase = CHG_PHASE_CV;
+        g_fsm.integ_cv = 0.0f;     /* 切相清零积分，防止积分残留 */
+        Log_Printf("[CCCV] Ubat reached Ucv, switch CC->CV\r\n");
+    }
+    if (g_fsm.phase == CHG_PHASE_CV && iout <= I_CUT_MA) {
+        g_fsm.phase = CHG_PHASE_DONE;
+        Log_Printf("[CCCV] Iout < Icut, charge done\r\n");
+        return;
+    }
+
+    /* ② PI 闭环 */
+    float duty = g_fsm.pwm_duty;
+    float dt   = (float)CTRL_PERIOD_MS / 1000.0f;     /* 秒 */
+
+    if (g_fsm.phase == CHG_PHASE_CC) {
+        float err = (float)I_CC_MA - (float)iout;     /* mA */
+        g_fsm.integ_cc += err * dt;
+        /* 积分钳位 ±10000，对应 KI*10000 ≈ 0.02 占空比，有效防饱和 */
+        if (g_fsm.integ_cc >  10000.0f) g_fsm.integ_cc =  10000.0f;
+        if (g_fsm.integ_cc < -10000.0f) g_fsm.integ_cc = -10000.0f;
+        duty += KP_CC * err + KI_CC * g_fsm.integ_cc;
+    }
+    else if (g_fsm.phase == CHG_PHASE_CV) {
+        float err = (float)U_CV_MV - (float)ubat;     /* mV */
+        g_fsm.integ_cv += err * dt;
+        if (g_fsm.integ_cv >  20000.0f) g_fsm.integ_cv =  20000.0f;
+        if (g_fsm.integ_cv < -20000.0f) g_fsm.integ_cv = -20000.0f;
+        duty += KP_CV * err + KI_CV * g_fsm.integ_cv;
+    }
+
+    Inverter_SetDuty(duty);
+}
+
+/* ============================================================================
+ *                              充 电 完 成 判 定
+ * ============================================================================
+ *  三个判据满足一个即认为充电完成：
+ *    A) CCCV 状态机已到 DONE（最严格判据）
+ *    B) Iout < Icut 且 Vout 接近 Ucv（CV 末尾自然结束）
+ *    C) SOC ≥ 99%（机器人侧 BMS 上报的兜底判据）          */
+/* ========================================================================== */
+static bool Charge_IsComplete(void)
+{
+    if (g_fsm.phase == CHG_PHASE_DONE)            return true;
+    if (g_sensor.i_out_ma < I_CUT_MA &&
+        g_sensor.v_out_mv >= U_CV_MV - 200U)      return true;
+    if (g_sensor.soc_percent >= 99U)              return true;
+    return false;
+}
+
+/* ============================================================================
+ *                              充 电 量 累 计
+ * ============================================================================
+ *  E(uWh) += V(mV) * I(mA) * dt(s) / 3600
+ *  使用 64-bit 累加防溢出（即使 24V*10A 充 24h 也只到约 5760 Wh）          */
+/* ========================================================================== */
+static void Charge_AccumulateEnergy(void)
+{
+    uint32_t now = HAL_GetTick();
+    uint32_t dt_ms = now - g_fsm.last_stat_tick;
+    if (dt_ms < 100) return;                          /* 每 100ms 积一次 */
+    g_fsm.last_stat_tick = now;
+
+    /* 瞬时功率 P = V * I (mV * mA = nW)，需要换算到 μW
+     * P_uw = (mV * mA) / 1000；E_uwh = P_uw * dt_h = P_uw * dt_ms / 3600000 */
+    uint64_t p_uw = (uint64_t)g_sensor.v_out_mv * g_sensor.i_out_ma / 1000ULL;
+    g_fsm.energy_uwh += p_uw * dt_ms / 3600000ULL;
+}
+
+/* ============================================================================
+ *                              功 率 降 额（T1 < T < T2）
+ * ============================================================================
+ *  滞回控制思想：T 上升到 T1 触发降额，但温度回落到多少才解除？
+ *  本实现：温度 ≤ T1 就解除（即没有滞回）。如果发现降额状态频繁切换，
+ *  可改为 ≤ T1-5 才解除，给一个 5℃ 的滞回带。            */
+/* ========================================================================== */
+static void Power_Derate(bool on)
+{
+    if (on && !g_fsm.derate_active) {
+        g_fsm.derate_active = true;
+        Log_Printf("[DERATE] T>T1, derate to %d%%\r\n",
+                   (int)(DERATE_DUTY_FACTOR * 100));
+        Inverter_SetDuty(g_fsm.pwm_duty);          /* 立即应用一次封顶 */
+    }
+    else if (!on && g_fsm.derate_active) {
+        g_fsm.derate_active = false;
+        Log_Printf("[DERATE] T<T1, restore full power\r\n");
+    }
+}
+
+/* ============================================================================
+ *                              异 常 检 测（右 图 分 支 判 定）
+ * ============================================================================
+ *  按右图流程图实现的分支判定：
+ *    优先级 1：Iin > Imax → 立即返回 ERR_OV_CURRENT，由上层走 OC_LOCKOUT
+ *    优先级 2：温度二级保护
+ *              T > T2 → 停机故障
+ *              T1<T<T2 → 降额运行（不返回错误）
+ *              T < T1 → 解除降额
+ *    优先级 3：母线/通信/FOD/超时 → 直接 FAULT                  */
+/* ========================================================================== */
+static bool Charge_DetectAbnormal(uint16_t *err)
+{
+    *err = ERR_NONE;
+
+    /* ---- 优先级 1：原边过流 ---- */
+    if (g_sensor.i_pri_ma > I_IN_MAX_MA) {
+        *err |= ERR_OV_CURRENT;
+        return true;       /* 立即返回，走 OC_LOCKOUT 软恢复路径 */
+    }
+
+    /* ---- 优先级 2：温度二级保护 ---- */
+    int16_t tmax = (g_sensor.t_mosfet_c > g_sensor.t_coil_c)
+                   ? g_sensor.t_mosfet_c : g_sensor.t_coil_c;
+    if (tmax > TEMP_T2_C) {
+        *err |= ERR_OV_TEMP;
+        return true;
+    }
+    else if (tmax > TEMP_T1_C) {
+        Power_Derate(true);
+    }
+    else {
+        Power_Derate(false);
+    }
+
+    /* ---- 优先级 3：其它运行时保护 ---- */
+    if (g_sensor.v_bus_mv > V_BUS_MAX_MV)   *err |= ERR_OV_VOLTAGE;
+    if (!g_sensor.comm_ok)                  *err |= ERR_COMM_LOST;
+
+    /* FOD 异物检测：输入功率 vs 输出功率，损耗超 50W 视为异物吸热 */
+    uint32_t p_in_w  = (g_sensor.v_bus_mv / 1000U) * (g_sensor.i_pri_ma / 1000U);
+    uint32_t p_out_w = (g_sensor.v_out_mv / 1000U) * (g_sensor.i_out_ma / 1000U);
+    if (p_in_w > 100U && p_out_w + 50U < p_in_w) {
+        *err |= ERR_FOREIGN_OBJECT;
+    }
+
+    /* 充电超时（保险丝） */
+    if ((HAL_GetTick() - g_fsm.charge_start_tick) > CHARGE_TIMEOUT_MS) {
+        *err |= ERR_TIMEOUT;
+    }
+    return (*err != ERR_NONE);
+}
+
+/* ============================================================================
+ *                              故 障 处 理 / 历 史 记 录
+ * ========================================================================== */
+
+/* 记录一条故障到环形缓冲（最近 8 条），售后可读取分析 */
+static void Fault_Record(uint16_t err)
+{
+    fault_record_t *r = &g_fsm.fault_hist[g_fsm.fault_hist_idx];
+    r->code        = err;
+    r->tick        = HAL_GetTick();
+    r->t_mosfet_c  = g_sensor.t_mosfet_c;
+    r->i_pri_ma    = g_sensor.i_pri_ma;
+    g_fsm.fault_hist_idx = (g_fsm.fault_hist_idx + 1U) & (FAULT_HISTORY_DEPTH - 1U);
+}
+
+static void Fault_Trigger(uint16_t err)
+{
+    g_fsm.err_flags = err;
+    Inverter_Stop();
+    Fault_Record(err);
+    Log_Printf("[FAULT] code=0x%04X t=%d ipri=%lu\r\n",
+               err, g_sensor.t_mosfet_c, g_sensor.i_pri_ma);
+    FSM_Goto(STATE_FAULT);
+}
+
+/* 故障恢复条件（必须三者都满足才能复位）：
+ *   ① 已在故障态停留 ≥ 3s（强制冷却）
+ *   ② 温度回落、母线正常
+ *   ③ 现场按下复位按钮（PC13，低电平有效）
+ * 这是工业惯例，避免设备自己反复尝试启动 */
+static bool Fault_TryRecover(void)
+{
+    if ((HAL_GetTick() - g_fsm.state_enter_tick) < 3000U) return false;
+
+    bool temp_ok = (g_sensor.t_mosfet_c < TEMP_T1_C) &&
+                   (g_sensor.t_coil_c   < TEMP_T1_C);
+    bool bus_ok  = (g_sensor.v_bus_mv > V_BUS_MIN_MV) &&
+                   (g_sensor.v_bus_mv < V_BUS_MAX_MV);
+    bool reset_btn = (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET);
+
+    return (temp_ok && bus_ok && reset_btn);
+}
+
+/* ============================================================================
+ *                              指 示 与 日 志
+ * ========================================================================== */
+
+static void Buzzer_Alarm(bool on)
+{
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1,
+                      on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+/* 三色 LED 状态指示：
+ *   绿(PB12)：待机/已完成
+ *   黄(PB13)：充电中（含软启动/恢复）
+ *   红(PB14)：故障/锁定 */
+static void LED_SetState(sys_state_t s)
+{
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+
+    switch (s) {
+    case STATE_STANDBY:
+    case STATE_OUTPUT_OFF:
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET); break;
+    case STATE_INVERTER_ON:
+    case STATE_CHARGING:
+    case STATE_SOFT_RESTART:
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET); break;
+    case STATE_FAULT:
+    case STATE_WAIT_RECOVER:
+    case STATE_OC_LOCKOUT:
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET); break;
+    default: break;
+    }
+}
+
+/* 简单的串口日志 printf：开发调试用，量产可用宏开关裁掉
+ * 注意：vsnprintf 在某些精简 libc 上不可用，需要选 newlib-nano  */
+static void Log_Printf(const char *fmt, ...)
+{
+    char buf[128];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        HAL_UART_Transmit(&huart1, (uint8_t *)buf, (uint16_t)n, 50);
+    }
+}
+
+/* ============================================================================
+ *                              中 断 回 调
+ * ============================================================================
+ *  这两个回调是"硬件级最后防线"：
+ *  ADC 模拟看门狗：ADC 设置上下窗，超出窗自动产生中断（响应 < 10μs）
+ *  TIM Break：定时器外部输入脚直接拉低 PWM 输出（响应 < 1 个 PWM 周期）
+ *  软件层的过流保护可能要 2~10ms 才反应，这两个机制能在器件烧毁前关断   */
+/* ========================================================================== */
+
+void HAL_ADC_LevelOutOfWindowCallback(ADC_HandleTypeDef *hadc)
+{
+    Inverter_Stop();
+    Fault_Trigger(ERR_OV_CURRENT);
+}
+
+void HAL_TIMEx_BreakCallback(TIM_HandleTypeDef *htim)
+{
+    Inverter_Stop();
+    Fault_Trigger(ERR_OV_CURRENT);
+}
+
+/* ============================================================================
+ *                              CubeMX 必备桩函数
+ * ========================================================================== */
+void Error_Handler(void)
+{
+    /* 任何 HAL_XXX_Init 失败都会调用这个函数，
+     * 必须在这里把功率回路彻底切断，然后让看门狗重启系统 */
+    Inverter_Stop();
+    Buzzer_Alarm(true);
+    while (1) { __NOP(); }
 }
